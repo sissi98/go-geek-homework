@@ -1,7 +1,9 @@
 package web
 
 import (
+	"fmt"
 	"regexp"
+	"strings"
 )
 
 type router struct {
@@ -24,13 +26,88 @@ func newRouter() router {
 // - 不能在同一个位置同时注册通配符路由和参数路由，例如 /user/:id 和 /user/* 冲突
 // - 同名路径参数，在路由匹配的时候，值会被覆盖。例如 /user/:id/abc/:id，那么 /user/123/abc/456 最终 id = 456
 func (r *router) addRoute(method string, path string, handler HandleFunc) {
-	panic("implement me")
+	// path不能为空
+	if path == "" {
+		panic("web: 路由是空字符串")
+	}
+	if path[0] != '/' {
+		panic("web: 路由必须以 / 开头")
+	}
+	if path != "/" && path[len(path)-1] == '/' {
+		panic("web: 路由不能以 / 结尾")
+	}
+	root, ok := r.trees[method]
+	//初始化method的路由树
+	if !ok {
+		root = &node{
+			path: "/",
+			typ:  nodeTypeStatic,
+		}
+		r.trees[method] = root
+	}
+	if path == "/" {
+		if root.handler != nil {
+			panic("web: 路由冲突[/]")
+		}
+		root.handler = handler
+		return
+	}
+	parts := strings.Split(path[1:], "/")
+	for _, p := range parts {
+		if p == "" {
+			panic(fmt.Sprintf("web: 非法路由。不允许使用 //a/b, /a//b 之类的路由, [%s]", path))
+		}
+		root = root.childOrCreate(p)
+	}
+	if root.handler != nil {
+
+		panic(fmt.Sprintf("web: 路由冲突[%s]", path))
+	}
+	root.handler = handler
+
 }
 
 // findRoute 查找对应的节点
 // 注意，返回的 node 内部 HandleFunc 不为 nil 才算是注册了路由
+
 func (r *router) findRoute(method string, path string) (*matchInfo, bool) {
-	panic("implement me")
+	root, ok := r.trees[method]
+	if !ok {
+		return nil, false
+	}
+
+	if path == "/" {
+		return &matchInfo{n: root}, true
+	}
+
+	segs := strings.Split(strings.Trim(path, "/"), "/")
+	mi := &matchInfo{}
+	for _, s := range segs {
+		if startChild := root.starChild; startChild != nil {
+			root, ok = root.childOf(s)
+			root.starChild = startChild
+		} else {
+			root, ok = root.childOf(s)
+		}
+		if !ok {
+			return nil, false
+		}
+		// 正则匹配路由
+		if root.typ == nodeTypeReg {
+			ok := root.regExpr.MatchString(s)
+			value := s
+			if !ok {
+				return mi, false
+			}
+			mi.addValue(root.paramName, value)
+		}
+		// 参数路由
+		if root.typ == nodeTypeParam {
+			mi.addValue(root.paramName, s)
+		}
+	}
+	mi.n = root
+	return mi, true
 }
 
 type nodeType int
@@ -78,8 +155,28 @@ type node struct {
 // child 返回子节点
 // 第一个返回值 *node 是命中的节点
 // 第二个返回值 bool 代表是否命中
+// /a/*  /a/b/c/d  /a/b
 func (n *node) childOf(path string) (*node, bool) {
-	panic("implement me")
+	if n.children == nil {
+		if n.regChild != nil {
+			return n.regChild, true
+		}
+		if n.paramChild != nil {
+			return n.paramChild, true
+		}
+		return n.starChild, n.starChild != nil
+	}
+	res, ok := n.children[path]
+	if !ok {
+		if n.regChild != nil {
+			return n.regChild, true
+		}
+		if n.paramChild != nil {
+			return n.paramChild, true
+		}
+		return n.starChild, n.starChild != nil
+	}
+	return res, true
 }
 
 // childOrCreate 查找子节点，
@@ -88,7 +185,81 @@ func (n *node) childOf(path string) (*node, bool) {
 // 最后会从 children 里面查找，
 // 如果没有找到，那么会创建一个新的节点，并且保存在 node 里面
 func (n *node) childOrCreate(path string) *node {
-	panic("implement me")
+	// 通配符匹配
+	if path == "*" {
+		if n.paramChild != nil {
+			panic(fmt.Sprintf("web: 非法路由，已有路径参数路由。不允许同时注册通配符路由和参数路由 [%s]", path))
+		}
+		if n.regChild != nil {
+			panic(fmt.Sprintf("web: 非法路由，已有正则路由。不允许同时注册通配符路由和正则路由 [%s]", path))
+		}
+		if n.starChild == nil {
+			n.starChild = &node{
+				typ:  nodeTypeAny,
+				path: path,
+			}
+		}
+		return n.starChild
+	}
+
+	if path[0] == ':' {
+		paramName, regExpr := getParamName(path)
+
+		// 正则匹配
+		if regExpr != nil {
+			if n.paramChild != nil {
+				panic(fmt.Sprintf("web: 非法路由，已有路径参数路由。不允许同时注册正则路由和参数路由 [%s]", path))
+			}
+			if n.starChild != nil {
+				panic(fmt.Sprintf("web: 非法路由，已有通配符路由。不允许同时注册通配符路由和正则路由 [%s]", path))
+			}
+			if n.regChild == nil {
+				n.regChild = &node{
+					typ:       nodeTypeReg,
+					path:      path,
+					paramName: paramName,
+					regExpr:   regExpr,
+				}
+			} else {
+				if n.regChild.path != path {
+					panic(fmt.Sprintf("web: 路由冲突，正则路由冲突，已有 %s，新注册 %s", n.regChild.path, path))
+				}
+			}
+			return n.regChild
+		}
+
+		//参数路由
+		if n.starChild != nil {
+			panic(fmt.Sprintf("web: 非法路由，已有通配符路由。不允许同时注册通配符路由和参数路由 [%s]", path))
+		}
+		if n.regChild != nil {
+			panic(fmt.Sprintf("web: 非法路由，已有正则路由。不允许同时注册正则路由和参数路由 [%s]", path))
+		}
+		if n.paramChild != nil {
+			if n.paramChild.path != path {
+				panic(fmt.Sprintf("web: 路由冲突，参数路由冲突，已有 %s，新注册 %s", n.paramChild.path, path))
+			}
+		} else {
+			n.paramChild = &node{
+				typ:       nodeTypeParam,
+				path:      path,
+				paramName: paramName,
+			}
+		}
+		return n.paramChild
+	}
+
+	if n.children == nil {
+		n.children = make(map[string]*node)
+	}
+	_, ok := n.children[path]
+	if !ok {
+		n.children[path] = &node{
+			typ:  nodeTypeStatic,
+			path: path,
+		}
+	}
+	return n.children[path]
 }
 
 type matchInfo struct {
@@ -102,4 +273,32 @@ func (m *matchInfo) addValue(key string, value string) {
 		m.pathParams = map[string]string{key: value}
 	}
 	m.pathParams[key] = value
+}
+
+func getParamName(path string) (string, *regexp.Regexp) {
+	var ans string
+	if path[0] != ':' {
+		return "", nil
+	}
+	for k, v := range path[1:] {
+		if v == '(' {
+			var end int
+			for i := len(path) - 1; i > k; i-- {
+				if path[i] == ')' {
+					end = i
+					break
+				}
+			}
+			if end == 0 {
+				panic("非法路由：正则匹配的括号必须成对")
+			}
+			regExpr, e := regexp.Compile(path[k+2 : end])
+			if e != nil {
+				panic("非法路由：正则匹配格式不正确")
+			}
+			return ans, regExpr
+		}
+		ans = ans + string(v)
+	}
+	return ans, nil
 }
